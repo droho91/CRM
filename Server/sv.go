@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	// ↙️  Đổi nếu go.mod không phải “module CRM”
@@ -25,6 +26,7 @@ type clientConn struct {
 	conn   net.Conn
 	rw     *bufio.ReadWriter
 	player *models.PlayerState
+	mu     sync.Mutex // bảo vệ player
 }
 
 /* ===== Helper methods để dùng như trước ===== */
@@ -227,7 +229,7 @@ func (gs *gameServer) registerPlayer(idx int, c net.Conn) {
 //			gs.turn = 1 - gs.turn
 //		}
 //	}
-//
+
 // ─────────────────────────────────────────────────────────────
 // continuous play
 func (gs *gameServer) runGameContinuous() {
@@ -393,8 +395,7 @@ func (gs *gameServer) awardEXP(user string, amt int) {
 
 func (gs *gameServer) broadcast(msg string) {
 	for _, cl := range gs.players {
-		cl.WriteString(msg)
-		cl.Flush()
+		cl.SafeWrite(msg)
 	}
 }
 
@@ -443,7 +444,8 @@ type deployCmd struct {
 
 func (gs *gameServer) readCommands(idx int, cl *clientConn) {
 	for {
-		cl.WriteString(fmt.Sprintf("Mana %d/10 – deploy: <slot 0-2> <L/R>\n", cl.player.Mana))
+
+		cl.SafePrintf("Mana %d/10 – deploy: <slot 0-2> <L/R>\n", cl.player.Mana)
 		cl.Flush()
 
 		line, err := cl.ReadString('\n')
@@ -495,23 +497,27 @@ func (gs *gameServer) processAttackFor(pIdx, slot int, lane string) {
 	defender := gs.players[1-pIdx].player
 	troop := &attacker.Troops[slot]
 
+	/* ── copy fields needed for the log BEFORE we mutate anything ── */
+	userName := attacker.Username
+	cardName := troop.Spec.Name
+
 	/* pick target by lane */
 	var target *models.Tower
 	if lane == "L" {
 		if defender.Towers[0].HP > 0 {
-			target = &defender.Towers[0] // GPxL
+			target = &defender.Towers[0]
 		} else {
-			target = &defender.Towers[2] // King
+			target = &defender.Towers[2]
 		}
-	} else { // "R"
+	} else {
 		if defender.Towers[1].HP > 0 {
-			target = &defender.Towers[1] // GPxR
+			target = &defender.Towers[1]
 		} else {
 			target = &defender.Towers[2]
 		}
 	}
 
-	/* damage calculation */
+	/* damage */
 	dmg := troop.Spec.ATK - target.Spec.DEF
 	if dmg < 0 {
 		dmg = 0
@@ -521,37 +527,60 @@ func (gs *gameServer) processAttackFor(pIdx, slot int, lane string) {
 		target.HP = 0
 	}
 
+	/* single, correct broadcast */
 	gs.broadcast(fmt.Sprintf(
 		"%s’s %s hit %s lane → %s (%d dmg, HP %d)\n",
-		attacker.Username, troop.Spec.Name, lane, target.Label, dmg, target.HP,
+		userName, cardName, lane, target.Label, dmg, target.HP,
 	))
 
-	/* draw a fresh troop into that slot */
+	/* now it’s safe to draw a new card for that slot */
 	newSpec := models.AllTroopSpecs[rand.Intn(len(models.AllTroopSpecs))]
 	attacker.Troops[slot] = models.NewTroop(newSpec, attacker.Level)
 }
 
 func (gs *gameServer) endByTimeout() {
-	alive := func(t []models.Tower) int {
-		c := 0
-		for _, tw := range t {
-			if tw.HP > 0 {
-				c++
-			}
+	// Choose winner by total towers
+	// alive := func(t []models.Tower) int {
+	// 	c := 0
+	// 	for _, tw := range t {
+	// 		if tw.HP > 0 {
+	// 			c++
+	// 		}
+	// 	}
+	// 	return c
+	// }
+
+	// a := alive(gs.players[0].player.Towers)
+	// b := alive(gs.players[1].player.Towers)
+
+	// if a < b {
+	// 	gs.declareWinner(1, 0) // P2 wins
+	// } else if b < a {
+	// 	gs.declareWinner(0, 1) // P1 wins
+	// } else {
+	// 	gs.broadcast("=== DRAW – time up ===\n")
+	// }
+
+	// Choose winner by total HP
+	total := func(ts []models.Tower) int {
+		sum := 0
+		for _, t := range ts {
+			sum += t.HP
 		}
-		return c
+		return sum
 	}
+	hpA := total(gs.players[0].player.Towers)
+	hpB := total(gs.players[1].player.Towers)
 
-	a := alive(gs.players[0].player.Towers)
-	b := alive(gs.players[1].player.Towers)
-
-	if a < b {
-		gs.declareWinner(1, 0) // P2 wins
-	} else if b < a {
-		gs.declareWinner(0, 1) // P1 wins
-	} else {
+	switch {
+	case hpA < hpB:
+		gs.declareWinner(0, 1)
+	case hpB < hpA:
+		gs.declareWinner(1, 0)
+	default:
 		gs.broadcast("=== DRAW – time up ===\n")
 	}
+
 }
 
 /*
@@ -561,6 +590,7 @@ func (gs *gameServer) endByTimeout() {
 
 ─────────────────────────────────────────────────────────────
 */
+
 func (gs *gameServer) declareWinner(winnerIdx, loserIdx int) {
 	winner := gs.players[winnerIdx]
 	loser := gs.players[loserIdx]
@@ -575,4 +605,28 @@ func (gs *gameServer) declareWinner(winnerIdx, loserIdx int) {
 
 	_ = winner.Close()
 	_ = loser.Close()
+}
+
+// --- thread-safe write methods ---
+// (không cần thiết, nhưng tốt hơn là không lock cả conn)
+// (để tránh deadlock nếu có nhiều goroutine cùng gọi WriteString)
+// (vì WriteString() gọi Flush() bên trong)
+// (có thể lock cả conn, nếu có goroutine khác đang đọc)
+// (nhưng không cần thiết, vì Flush() không block)
+// (vì Flush() không block, chỉ block khi có nhiều goroutine cùng gọi)
+// (nên dùng mutex để lock cả conn, nếu có nhiều goroutine cùng gọi)
+// (để tránh deadlock nếu có nhiều goroutine cùng gọi WriteString)
+// (vì WriteString() gọi Flush() bên trong)
+func (c *clientConn) SafeWrite(s string) {
+	c.mu.Lock()
+	c.rw.WriteString(s)
+	c.rw.Flush()
+	c.mu.Unlock()
+}
+
+func (c *clientConn) SafePrintf(format string, a ...interface{}) {
+	c.mu.Lock()
+	fmt.Fprintf(c.rw, format, a...)
+	c.rw.Flush()
+	c.mu.Unlock()
 }
